@@ -14,6 +14,11 @@
 #define VENUS_MAX_SLICE_BATCHES 64
 #define VENUS_ACCESS_UNIT_OVERHEAD 4096u
 #define VENUS_SYNC_TIMEOUT_MS 30000
+/* How long both sides must have been quiet before a stalled surface sync is
+ * allowed to drain the decoder.  See
+ * sync_surface_locked() for why this exists.
+ */
+#define VENUS_QUIET_MS_BEFORE_DRAIN 1000
 
 static int64_t monotonic_milliseconds(void)
 {
@@ -45,7 +50,8 @@ static void destroy_context_buffers(struct venus_backend *backend,
 int venus_decode_store_frame_locked(
     const struct venus_v4l2_frame *frame, void *opaque)
 {
-    struct venus_backend *backend = opaque;
+    struct venus_context *context = opaque;
+    struct venus_backend *backend = context ? context->backend : NULL;
     struct venus_surface *surface;
     uint8_t *resized;
     uint32_t stride;
@@ -55,7 +61,7 @@ int venus_decode_store_frame_locked(
     size_t destination_size;
     unsigned int row;
 
-    if (!frame || frame->tag > UINT32_MAX ||
+    if (!backend || !frame || frame->tag > UINT32_MAX ||
         frame->width == 0 || frame->height == 0 ||
         (frame->width & 1u) || (frame->height & 1u))
         return -EINVAL;
@@ -118,6 +124,8 @@ int venus_decode_store_frame_locked(
 
     surface->data_size = destination_size;
     surface->ready = true;
+    context->received_frames++;
+    context->last_activity_ms = monotonic_milliseconds();
     venus_backend_log(
         backend,
         "capture surface=0x%x tag=%llu bytes=%zu visible=%ux%u coded=%ux%u stride=%u",
@@ -535,7 +543,15 @@ static VAStatus backend_end_picture(VADriverContextP driver_context,
                       access_unit_size);
     status = venus_v4l2_decoder_submit(
         context->decoder, access_unit, access_unit_size,
-        context->target, venus_decode_store_frame_locked, backend);
+        context->target, venus_decode_store_frame_locked, context);
+    if (status == 0) {
+        context->submitted_pictures++;
+        context->last_activity_ms = monotonic_milliseconds();
+        /* New input: a later stall is a new deadlock, not the one we
+         * already drained for.
+         */
+        context->drained = false;
+    }
 
 finish:
     free(access_unit);
@@ -549,6 +565,45 @@ finish:
     pthread_mutex_unlock(&backend->mutex);
     return status < 0 ? venus_backend_status_from_errno(status)
                       : VA_STATUS_SUCCESS;
+}
+
+/*
+ * Force the decoder to hand back the frames it is holding, then put the
+ * session back to work: V4L2_DEC_CMD_STOP flushes the reorder buffer, and
+ * V4L2_DEC_CMD_START lets the client keep feeding pictures afterwards.
+ * Without the resume the session is dead for any further picture, which is
+ * why the drain is only safe as a stop/start pair.
+ */
+static int drain_decoder_locked(struct venus_backend *backend,
+                                struct venus_context *context)
+{
+    bool end_of_stream = false;
+    unsigned int guard = 0;
+    int status;
+
+    status = venus_v4l2_decoder_stop(context->decoder);
+    if (status < 0)
+        return status;
+
+    while (!end_of_stream && guard++ < 200) {
+        status = venus_v4l2_decoder_pump(
+            context->decoder, 1000, venus_decode_store_frame_locked,
+            context, &end_of_stream);
+        if (status < 0 && status != -ETIMEDOUT && status != -EAGAIN)
+            break;
+    }
+
+    status = venus_v4l2_decoder_resume(context->decoder);
+    if (status < 0)
+        return status;
+
+    context->drained = true;
+    venus_backend_log(
+        backend, "decoder drained, %llu/%llu frames out%s",
+        (unsigned long long)context->received_frames,
+        (unsigned long long)context->submitted_pictures,
+        end_of_stream ? "" : " (incomplete)");
+    return 0;
 }
 
 static VAStatus sync_surface_locked(struct venus_backend *backend,
@@ -574,14 +629,50 @@ static VAStatus sync_surface_locked(struct venus_backend *backend,
            monotonic_milliseconds() < deadline) {
         int status = venus_v4l2_decoder_pump(
             context->decoder, 1000,
-            venus_decode_store_frame_locked, backend, NULL);
+            venus_decode_store_frame_locked, context, NULL);
 
-        if (status == -ETIMEDOUT || status == -EAGAIN)
-            continue;
-        if (status < 0)
+        if (status < 0 && status != -ETIMEDOUT && status != -EAGAIN)
             return venus_backend_status_from_errno(status);
+
+        /*
+         * A stall here is usually harmless: a reordered frame is waiting for
+         * pictures the client's decoder thread is still submitting, and the
+         * wait ends by itself.  When the client has stopped submitting
+         * altogether the decoder is instead holding frames it will never
+         * release on its own, and so is the client: a stateful decoder emits
+         * a reordered frame only after the next picture arrives, while the
+         * client cannot submit that picture until a sync frees a surface
+         * from its pool.  Draining is the only way out of that deadlock.
+         *
+         * ponytail: heuristic.  VA-API has no end-of-stream call, so "no
+         * picture in and no picture out for 1s while a sync is pending"
+         * stands in for it.  Both halves are needed - the client's decoder
+         * thread keeps submitting while a reordered frame waits for its
+         * references.  Raise VENUS_QUIET_MS_BEFORE_DRAIN if a client ever
+         * pauses longer than that in the middle of one continuous stream.
+         */
+        if (!context->drained &&
+            context->submitted_pictures > 0 &&
+            context->last_activity_ms != 0 &&
+            monotonic_milliseconds() - context->last_activity_ms >=
+                VENUS_QUIET_MS_BEFORE_DRAIN) {
+            int drain = drain_decoder_locked(backend, context);
+
+            if (drain < 0)
+                return venus_backend_status_from_errno(drain);
+        }
     }
 
+    if (!surface->ready)
+        venus_backend_log(
+            backend,
+            "sync FAILED surface=0x%x ready=%d bytes=%zu submitted=%llu "
+            "received=%llu in_flight=%llu",
+            surface->id, surface->ready, surface->data_size,
+            (unsigned long long)context->submitted_pictures,
+            (unsigned long long)context->received_frames,
+            (unsigned long long)(context->submitted_pictures -
+                                 context->received_frames));
     return surface->ready ? VA_STATUS_SUCCESS
                           : VA_STATUS_ERROR_HW_BUSY;
 }

@@ -25,9 +25,28 @@ static int xioctl(int fd, unsigned long request, void *argument)
     return result;
 }
 
-static bool qcom_venus_device(const struct v4l2_capability *cap)
+/* One place decides which driver names we accept, so probe and the
+ * decoder/encoder sessions can never disagree about the contract.
+ */
+static const char *const supported_drivers[] = {
+    "qcom-venus",      /* upstream venus / iris */
+    "msm_vidc_driver", /* Qualcomm downstream msm_vidc (iris_vpu.ko) */
+};
+
+bool venus_v4l2_driver_supported(const struct v4l2_capability *cap)
 {
-    return strcmp((const char *)cap->driver, "qcom-venus") == 0;
+    size_t i;
+
+    if (!cap)
+        return false;
+
+    for (i = 0; i < sizeof(supported_drivers) / sizeof(supported_drivers[0]);
+         i++) {
+        if (strcmp((const char *)cap->driver, supported_drivers[i]) == 0)
+            return true;
+    }
+
+    return false;
 }
 
 static bool device_role(const struct v4l2_capability *cap,
@@ -106,7 +125,7 @@ int venus_v4l2_probe_prefix(struct venus_capabilities *caps,
             continue;
 
         if (xioctl(fd, VIDIOC_QUERYCAP, &capability) == 0 &&
-            qcom_venus_device(&capability) &&
+            venus_v4l2_driver_supported(&capability) &&
             device_role(&capability, &role)) {
             found = true;
             remember_path(caps, role, path);

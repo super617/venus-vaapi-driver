@@ -1,9 +1,94 @@
 // SPDX-License-Identifier: MIT
 #include "backend_internal.h"
 
+#include <fcntl.h>
 #include <limits.h>
+#include <linux/dma-heap.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/ioctl.h>
+#include <sys/mman.h>
+#include <unistd.h>
+#include <va/va_drmcommon.h>
+
+/* Defined locally so libdrm headers are not a build dependency: this driver
+ * only ever exports one format, and both values are frozen ABI.
+ */
+#define VENUS_DRM_FORMAT_NV12 \
+    VENUS_FOURCC('N', 'V', '1', '2')
+#define VENUS_DRM_FORMAT_MOD_LINEAR 0ULL
+#define VENUS_FOURCC(a, b, c, d)                     \
+    ((uint32_t)(a) | ((uint32_t)(b) << 8) |          \
+     ((uint32_t)(c) << 16) | ((uint32_t)(d) << 24))
+
+/*
+ * Surface backing store.
+ *
+ * Surfaces are allocated from a DMA-BUF heap so vaExportSurfaceHandle() can
+ * hand applications a file descriptor for zero-copy/EGL import - that is what
+ * mpv's vaapi hwdec and VLC's GL interop need.  They stay CPU-mappable, which
+ * is what the copy-based download path in decode.c uses.
+ *
+ * Without an accessible heap the driver falls back to plain memory: every
+ * VA-API entry point keeps working except the export ones, which report the
+ * surface as unsupported rather than lying about it.
+ */
+static const char *const surface_heaps[] = {
+    "/dev/dma_heap/qcom,system",
+    "/dev/dma_heap/system",
+};
+
+static uint8_t *surface_memory_allocate(size_t size, int *fd_out)
+{
+    size_t i;
+
+    *fd_out = -1;
+
+    for (i = 0; i < sizeof(surface_heaps) / sizeof(surface_heaps[0]); i++) {
+        struct dma_heap_allocation_data request = {
+            .len = size,
+            .fd_flags = O_RDWR | O_CLOEXEC,
+        };
+        uint8_t *mapping;
+        int heap;
+
+        heap = open(surface_heaps[i], O_RDWR | O_CLOEXEC);
+        if (heap < 0)
+            continue;
+        if (ioctl(heap, DMA_HEAP_IOCTL_ALLOC, &request) < 0) {
+            close(heap);
+            continue;
+        }
+        close(heap);
+
+        mapping = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED,
+                       request.fd, 0);
+        if (mapping == MAP_FAILED) {
+            close(request.fd);
+            continue;
+        }
+
+        memset(mapping, 0, size);
+        *fd_out = (int)request.fd;
+        return mapping;
+    }
+
+    return calloc(1, size);
+}
+
+static void surface_memory_release(uint8_t *data, int fd, size_t size)
+{
+    if (!data)
+        return;
+
+    if (fd < 0) {
+        free(data);
+        return;
+    }
+
+    munmap(data, size);
+    close(fd);
+}
 
 static int nv12_size(unsigned int width, unsigned int height,
                      size_t *size)
@@ -101,6 +186,37 @@ static bool valid_surface_attributes(VASurfaceAttrib *attributes,
     return true;
 }
 
+/*
+ * Surface creation requests that the driver refuses are worth logging with
+ * their parameters: clients (FFmpeg's hwframe pool in particular) retry with
+ * different attribute sets, and without the request on record the only
+ * symptom is an opaque VA_STATUS_ERROR_*.
+ */
+static VAStatus reject_surfaces(struct venus_backend *backend,
+                                unsigned int format, unsigned int width,
+                                unsigned int height, unsigned int num_surfaces,
+                                VASurfaceAttrib *attributes,
+                                unsigned int num_attributes,
+                                VAStatus status)
+{
+    unsigned int index;
+
+    venus_backend_log(backend,
+                      "create-surface rejected status=0x%x format=0x%x %ux%u "
+                      "count=%u attributes=%u",
+                      status, format, width, height, num_surfaces,
+                      num_attributes);
+    for (index = 0; index < num_attributes; index++)
+        venus_backend_log(backend,
+                          "  attribute[%u] type=%d flags=0x%x value_type=%d "
+                          "value=%lld",
+                          index, attributes[index].type,
+                          attributes[index].flags,
+                          attributes[index].value.type,
+                          (long long)attributes[index].value.value.i);
+    return status;
+}
+
 static VAStatus create_surfaces_locked(
     struct venus_backend *backend, unsigned int format,
     unsigned int width, unsigned int height,
@@ -115,18 +231,26 @@ static VAStatus create_surfaces_locked(
     unsigned int index;
 
     if (!(format & VA_RT_FORMAT_YUV420))
-        return VA_STATUS_ERROR_UNSUPPORTED_RT_FORMAT;
+        return reject_surfaces(backend, format, width, height, num_surfaces,
+                               attributes, num_attributes,
+                               VA_STATUS_ERROR_UNSUPPORTED_RT_FORMAT);
     if (!surface_ids || num_surfaces == 0 ||
         num_surfaces > VENUS_MAX_SURFACES ||
-        width < VENUS_MIN_WIDTH || height < VENUS_MIN_HEIGHT ||
+        width < VENUS_MIN_SURFACE_WIDTH ||
+        height < VENUS_MIN_SURFACE_HEIGHT ||
         width > VENUS_MAX_WIDTH || height > VENUS_MAX_HEIGHT ||
         nv12_size(width, height, &capacity) < 0)
-        return VA_STATUS_ERROR_INVALID_PARAMETER;
+        return reject_surfaces(backend, format, width, height, num_surfaces,
+                               attributes, num_attributes,
+                               VA_STATUS_ERROR_INVALID_PARAMETER);
     if (num_attributes > 0 && !attributes)
-        return VA_STATUS_ERROR_INVALID_PARAMETER;
-    if (!valid_surface_attributes(
-            attributes, num_attributes, &fourcc))
-        return VA_STATUS_ERROR_UNSUPPORTED_MEMORY_TYPE;
+        return reject_surfaces(backend, format, width, height, num_surfaces,
+                               attributes, num_attributes,
+                               VA_STATUS_ERROR_INVALID_PARAMETER);
+    if (!valid_surface_attributes(attributes, num_attributes, &fourcc))
+        return reject_surfaces(backend, format, width, height, num_surfaces,
+                               attributes, num_attributes,
+                               VA_STATUS_ERROR_UNSUPPORTED_MEMORY_TYPE);
 
     for (index = 0; index < VENUS_MAX_SURFACES; index++) {
         if (!backend->surfaces[index].used)
@@ -143,9 +267,12 @@ static VAStatus create_surfaces_locked(
         if (surface->used)
             continue;
 
-        surface->data = calloc(1, capacity);
-        if (!surface->data)
+        surface->data = surface_memory_allocate(
+            capacity, &surface->dmabuf_fd);
+        if (!surface->data) {
+            surface->dmabuf_fd = -1;
             goto fail;
+        }
 
         surface->used = true;
         surface->id = VENUS_SURFACE_BASE | (index + 1);
@@ -159,9 +286,10 @@ static VAStatus create_surfaces_locked(
         surface->context_id = VA_INVALID_ID;
         created[created_count] = surface;
         surface_ids[created_count] = surface->id;
-        venus_backend_log(backend,
-                          "create-surface id=0x%x size=%ux%u bytes=%zu",
-                          surface->id, width, height, capacity);
+        venus_backend_log(
+            backend,
+            "create-surface id=0x%x size=%ux%u bytes=%zu dmabuf=%d",
+            surface->id, width, height, capacity, surface->dmabuf_fd);
         created_count++;
     }
 
@@ -171,7 +299,8 @@ fail:
     while (created_count > 0) {
         struct venus_surface *surface = created[--created_count];
 
-        free(surface->data);
+        surface_memory_release(
+            surface->data, surface->dmabuf_fd, surface->capacity);
         memset(surface, 0, sizeof(*surface));
     }
     return VA_STATUS_ERROR_ALLOCATION_FAILED;
@@ -243,7 +372,8 @@ static VAStatus backend_destroy_surfaces(
         struct venus_surface *surface =
             venus_backend_find_surface(backend, surface_ids[index]);
 
-        free(surface->data);
+        surface_memory_release(
+            surface->data, surface->dmabuf_fd, surface->capacity);
         memset(surface, 0, sizeof(*surface));
     }
 
@@ -744,7 +874,8 @@ static VAStatus backend_query_surface_attributes(
                  VA_SURFACE_ATTRIB_SETTABLE,
         .value = {
             .type = VAGenericValueTypeInteger,
-            .value.i = VA_SURFACE_ATTRIB_MEM_TYPE_VA,
+            .value.i = VA_SURFACE_ATTRIB_MEM_TYPE_VA |
+                       VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2,
         },
     };
     values[2] = (VASurfaceAttrib) {
@@ -752,7 +883,7 @@ static VAStatus backend_query_surface_attributes(
         .flags = VA_SURFACE_ATTRIB_GETTABLE,
         .value = {
             .type = VAGenericValueTypeInteger,
-            .value.i = VENUS_MIN_WIDTH,
+            .value.i = VENUS_MIN_SURFACE_WIDTH,
         },
     };
     values[3] = (VASurfaceAttrib) {
@@ -760,7 +891,7 @@ static VAStatus backend_query_surface_attributes(
         .flags = VA_SURFACE_ATTRIB_GETTABLE,
         .value = {
             .type = VAGenericValueTypeInteger,
-            .value.i = VENUS_MIN_HEIGHT,
+            .value.i = VENUS_MIN_SURFACE_HEIGHT,
         },
     };
     values[4] = (VASurfaceAttrib) {
@@ -807,11 +938,85 @@ void venus_objects_destroy_all(struct venus_backend *backend)
     for (index = 0; index < VENUS_MAX_BUFFERS; index++)
         venus_backend_free_buffer(&backend->buffers[index]);
     for (index = 0; index < VENUS_MAX_SURFACES; index++) {
-        free(backend->surfaces[index].data);
+        surface_memory_release(backend->surfaces[index].data,
+                               backend->surfaces[index].dmabuf_fd,
+                               backend->surfaces[index].capacity);
         memset(&backend->surfaces[index], 0,
                sizeof(backend->surfaces[index]));
     }
     memset(backend->configs, 0, sizeof(backend->configs));
+}
+
+/*
+ * Zero-copy hand-off.  Both mpv (libavutil) and VLC resolve
+ * vaExportSurfaceHandle and will not use hardware decoding without it; with it
+ * they can import the decoded surface as an EGLImage and stay on the GPU.
+ *
+ * A linearly-mapped DMA-BUF heap buffer holds NV12 as one object with two
+ * planes, which is the layout everything expects for a semi-planar format.
+ * The application owns the returned fd and closes it.
+ */
+static VAStatus backend_export_surface_handle(
+    VADriverContextP context, VASurfaceID surface_id, uint32_t memory_type,
+    uint32_t flags, void *descriptor)
+{
+    struct venus_backend *backend =
+        venus_backend_from_context(context);
+    VADRMPRIMESurfaceDescriptor *exported = descriptor;
+    struct venus_surface *surface;
+    uint32_t luma_size;
+    int fd;
+
+    if (!backend || !descriptor)
+        return VA_STATUS_ERROR_INVALID_PARAMETER;
+    if (memory_type != VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2)
+        return VA_STATUS_ERROR_UNSUPPORTED_MEMORY_TYPE;
+    if (flags & ~(uint32_t)(VA_EXPORT_SURFACE_READ_ONLY |
+                            VA_EXPORT_SURFACE_WRITE_ONLY |
+                            VA_EXPORT_SURFACE_READ_WRITE |
+                            VA_EXPORT_SURFACE_SEPARATE_LAYERS |
+                            VA_EXPORT_SURFACE_COMPOSED_LAYERS))
+        return VA_STATUS_ERROR_INVALID_PARAMETER;
+
+    pthread_mutex_lock(&backend->mutex);
+    surface = venus_backend_find_surface(backend, surface_id);
+    if (!surface || surface->dmabuf_fd < 0) {
+        pthread_mutex_unlock(&backend->mutex);
+        return surface ? VA_STATUS_ERROR_UNSUPPORTED_MEMORY_TYPE
+                       : VA_STATUS_ERROR_INVALID_SURFACE;
+    }
+
+    fd = fcntl(surface->dmabuf_fd, F_DUPFD_CLOEXEC, 0);
+    if (fd < 0) {
+        pthread_mutex_unlock(&backend->mutex);
+        return VA_STATUS_ERROR_OPERATION_FAILED;
+    }
+
+    luma_size = surface->width * surface->height;
+    memset(exported, 0, sizeof(*exported));
+    exported->fourcc = VA_FOURCC_NV12;
+    exported->width = surface->width;
+    exported->height = surface->height;
+    exported->num_objects = 1;
+    exported->objects[0].fd = fd;
+    exported->objects[0].size = (uint32_t)surface->capacity;
+    exported->objects[0].drm_format_modifier = VENUS_DRM_FORMAT_MOD_LINEAR;
+    exported->num_layers = 1;
+    exported->layers[0].drm_format = VENUS_DRM_FORMAT_NV12;
+    exported->layers[0].num_planes = 2;
+    exported->layers[0].object_index[0] = 0;
+    exported->layers[0].object_index[1] = 0;
+    exported->layers[0].offset[0] = 0;
+    exported->layers[0].offset[1] = luma_size;
+    exported->layers[0].pitch[0] = surface->width;
+    exported->layers[0].pitch[1] = surface->width;
+    pthread_mutex_unlock(&backend->mutex);
+
+    venus_backend_log(backend,
+                      "export-surface id=0x%x fd=%d bytes=%zu %ux%u",
+                      surface_id, fd, surface->capacity, surface->width,
+                      surface->height);
+    return VA_STATUS_SUCCESS;
 }
 
 void venus_objects_fill_vtable(struct VADriverVTable *vtable)
@@ -833,4 +1038,5 @@ void venus_objects_fill_vtable(struct VADriverVTable *vtable)
     vtable->vaPutImage = backend_put_image;
     vtable->vaQuerySurfaceAttributes =
         backend_query_surface_attributes;
+    vtable->vaExportSurfaceHandle = backend_export_surface_handle;
 }

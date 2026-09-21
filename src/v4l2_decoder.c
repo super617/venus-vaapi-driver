@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: MIT
 #include "v4l2_decoder.h"
+#include "v4l2_probe.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -313,7 +314,7 @@ static int verify_device(struct venus_v4l2_decoder *decoder)
                ? capability.device_caps
                : capability.capabilities;
 
-    if (strcmp((const char *)capability.driver, "qcom-venus") != 0 ||
+    if (!venus_v4l2_driver_supported(&capability) ||
         !strstr((const char *)capability.card, "decoder") ||
         !(caps & V4L2_CAP_VIDEO_M2M_MPLANE) ||
         !(caps & V4L2_CAP_STREAMING))
@@ -670,6 +671,25 @@ int venus_v4l2_decoder_stop(struct venus_v4l2_decoder *decoder)
         return decoder_error(decoder, "VIDIOC_DECODER_CMD(STOP)");
 
     decoder->stop_sent = true;
+    return 0;
+}
+
+int venus_v4l2_decoder_resume(struct venus_v4l2_decoder *decoder)
+{
+    struct v4l2_decoder_cmd command = {
+        .cmd = V4L2_DEC_CMD_START,
+    };
+
+    if (!decoder || decoder->fd < 0)
+        return -EINVAL;
+
+    if (!decoder->stop_sent)
+        return 0;
+
+    if (xioctl(decoder->fd, VIDIOC_DECODER_CMD, &command) < 0)
+        return decoder_error(decoder, "VIDIOC_DECODER_CMD(START)");
+
+    decoder->stop_sent = false;
     return 0;
 }
 

@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: MIT
 #include "v4l2_encoder.h"
+#include "v4l2_probe.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -67,7 +68,7 @@ static int verify_device(struct venus_v4l2_encoder *encoder)
                ? capability.device_caps
                : capability.capabilities;
 
-    if (strcmp((const char *)capability.driver, "qcom-venus") != 0 ||
+    if (!venus_v4l2_driver_supported(&capability) ||
         !strstr((const char *)capability.card, "encoder") ||
         !(caps & V4L2_CAP_VIDEO_M2M_MPLANE) ||
         !(caps & V4L2_CAP_STREAMING)) {

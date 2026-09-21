@@ -30,6 +30,14 @@
 #define VENUS_MIN_HEIGHT 32u
 #define VENUS_MAX_WIDTH 4096u
 #define VENUS_MAX_HEIGHT 4096u
+
+/* Surfaces are only memory, so they are not bound by the decoder's minimum
+ * picture size.  Clients allocate tiny ones on purpose: mpv's hwupload probes
+ * with 16x16.  They must still be even, because the NV12 layout is
+ * luma-then-interleaved-chroma with no padding.
+ */
+#define VENUS_MIN_SURFACE_WIDTH 16u
+#define VENUS_MIN_SURFACE_HEIGHT 16u
 #define VENUS_H264_MAX_MACROBLOCKS 36864u
 #define VENUS_H264_MAX_MACROBLOCKS_PER_SECOND 1036800u
 
@@ -48,6 +56,7 @@ struct venus_surface {
     unsigned int height;
     uint32_t fourcc;
     uint8_t *data;
+    int dmabuf_fd;
     size_t capacity;
     size_t data_size;
     bool ready;
@@ -92,6 +101,10 @@ struct venus_context {
     struct venus_v4l2_encoder *encoder;
     bool in_picture;
     VASurfaceID target;
+    uint64_t submitted_pictures;
+    uint64_t received_frames;
+    int64_t last_activity_ms;
+    bool drained;
     VABufferID pending[VENUS_MAX_PENDING_BUFFERS];
     size_t pending_count;
     VABufferID encode_queue[VENUS_MAX_SURFACES];

@@ -47,6 +47,7 @@ int venus_v4l2_decoder_pump(struct venus_v4l2_decoder *decoder,
                             venus_v4l2_frame_callback callback,
                             void *opaque, bool *end_of_stream);
 int venus_v4l2_decoder_stop(struct venus_v4l2_decoder *decoder);
+int venus_v4l2_decoder_resume(struct venus_v4l2_decoder *decoder);
 void venus_v4l2_decoder_close(struct venus_v4l2_decoder *decoder);
 
 const char *venus_v4l2_decoder_last_operation(
