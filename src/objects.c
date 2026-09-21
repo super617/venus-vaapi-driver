@@ -178,9 +178,15 @@ static bool valid_surface_attributes(VASurfaceAttrib *attributes,
                 !(attribute->value.value.i &
                   VA_SURFACE_ATTRIB_MEM_TYPE_VA))
                 return false;
-        } else if (attribute->flags & VA_SURFACE_ATTRIB_SETTABLE) {
-            return false;
+        } else if (attribute->type == VASurfaceAttribUsageHint) {
+            /* Purely advisory: GStreamer's va plugin always sets
+             * VA_SURFACE_ATTRIB_USAGE_HINT_DECODER. Nothing to do with it,
+             * but rejecting it made every GStreamer decoder unusable. */
+            if (attribute->value.type != VAGenericValueTypeInteger)
+                return false;
         }
+        /* Anything else is ignored, as the VA spec requires: only an
+         * unsupported memory type is an error. */
     }
 
     return true;
@@ -916,12 +922,8 @@ static VAStatus backend_query_surface_attributes(
         pthread_mutex_unlock(&backend->mutex);
         return VA_STATUS_SUCCESS;
     }
-    if (*num_attributes < required) {
-        *num_attributes = required;
-        pthread_mutex_unlock(&backend->mutex);
-        return VA_STATUS_ERROR_MAX_NUM_EXCEEDED;
-    }
-
+    /* *num_attributes is out-only per va.h (see backend.c); the caller
+     * sizes the array to vaMaxNumSurfaceAttributes(). */
     memcpy(attributes, values, sizeof(values));
     *num_attributes = required;
     pthread_mutex_unlock(&backend->mutex);

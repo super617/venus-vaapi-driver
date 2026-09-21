@@ -454,12 +454,10 @@ static VAStatus backend_query_config_attributes(
         pthread_mutex_unlock(&backend->mutex);
         return VA_STATUS_SUCCESS;
     }
-    if (*num_attributes < required) {
-        *num_attributes = required;
-        pthread_mutex_unlock(&backend->mutex);
-        return VA_STATUS_ERROR_MAX_NUM_EXCEEDED;
-    }
-
+    /* va.h: the caller's array holds at least vaMaxNumConfigAttributes()
+     * entries and *num_attributes is out-only. GStreamer relies on that --
+     * gstvadisplay passes a properly sized array but leaves the count
+     * uninitialised, so honouring it as a capacity rejects valid calls. */
     attributes[0] = (VAConfigAttrib) {
         .type = VAConfigAttribRTFormat,
         .value = VA_RT_FORMAT_YUV420,
