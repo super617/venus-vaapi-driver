@@ -19,6 +19,11 @@
 #define VENUS_MAX_BUFFERS 512
 #define VENUS_MAX_IMAGES 128
 #define VENUS_MAX_PENDING_BUFFERS 128
+/* vaAcquireBufferHandle() hands out one dup()'ed DMA-BUF fd per buffer that a
+ * client is holding open for EGL import.  One per image is the most any client
+ * needs, so the table is sized like the image table.
+ */
+#define VENUS_MAX_BUFFER_HANDLES VENUS_MAX_IMAGES
 
 #define VENUS_CONFIG_BASE 0x01000000u
 #define VENUS_CONTEXT_BASE 0x02000000u
@@ -88,6 +93,15 @@ struct venus_image {
     VASurfaceID surface_id;
 };
 
+/* An external reference to a surface's DMA-BUF, handed out to applications
+ * that import VA surfaces through the pre-1.1 vaAcquireBufferHandle() API.
+ * buffer_id == 0 marks a free slot; VABufferIDs are never 0.
+ */
+struct venus_buffer_handle {
+    VABufferID buffer_id;
+    int fd;
+};
+
 struct venus_context {
     bool used;
     VAContextID id;
@@ -122,6 +136,7 @@ struct venus_backend {
     struct venus_surface surfaces[VENUS_MAX_SURFACES];
     struct venus_buffer buffers[VENUS_MAX_BUFFERS];
     struct venus_image images[VENUS_MAX_IMAGES];
+    struct venus_buffer_handle handles[VENUS_MAX_BUFFER_HANDLES];
 };
 
 struct venus_backend *venus_backend_from_context(VADriverContextP context);

@@ -16,6 +16,13 @@
  */
 #define VENUS_DRM_FORMAT_NV12 \
     VENUS_FOURCC('N', 'V', '1', '2')
+/* Per-plane formats for the separate-layer export layout: luma is a single
+ * byte per pixel, chroma is an interleaved pair, which is what DRM_FORMAT_GR88
+ * means. */
+#define VENUS_DRM_FORMAT_R8 \
+    VENUS_FOURCC('R', '8', ' ', ' ')
+#define VENUS_DRM_FORMAT_GR88 \
+    VENUS_FOURCC('G', 'R', '8', '8')
 #define VENUS_DRM_FORMAT_MOD_LINEAR 0ULL
 #define VENUS_FOURCC(a, b, c, d)                     \
     ((uint32_t)(a) | ((uint32_t)(b) << 8) |          \
@@ -514,6 +521,9 @@ static VAStatus backend_unmap_buffer(VADriverContextP context,
     return status;
 }
 
+static void release_buffer_handle_locked(struct venus_backend *backend,
+                                         VABufferID buffer_id);
+
 static bool buffer_used_by_image(struct venus_backend *backend,
                                  VABufferID buffer_id)
 {
@@ -555,6 +565,12 @@ static VAStatus backend_destroy_buffer(VADriverContextP context,
             surface->coded_buffer_id = VA_INVALID_ID;
         }
     }
+
+    /* Keep the fd table in step with the buffer table: buffer IDs are reused
+     * by the next allocate_buffer(), so a stale entry would hand a client an
+     * fd for the wrong buffer - or close one it is still using.
+     */
+    release_buffer_handle_locked(backend, buffer_id);
 
     venus_backend_free_buffer(buffer);
     pthread_mutex_unlock(&backend->mutex);
@@ -743,6 +759,7 @@ static VAStatus backend_destroy_image(VADriverContextP context,
     }
 
     buffer = venus_backend_find_buffer(backend, image->buffer_id);
+    release_buffer_handle_locked(backend, image->buffer_id);
     venus_backend_free_buffer(buffer);
     memset(image, 0, sizeof(*image));
     pthread_mutex_unlock(&backend->mutex);
@@ -934,6 +951,13 @@ void venus_objects_destroy_all(struct venus_backend *backend)
 {
     unsigned int index;
 
+    for (index = 0; index < VENUS_MAX_BUFFER_HANDLES; index++) {
+        if (backend->handles[index].fd >= 0 &&
+            backend->handles[index].buffer_id)
+            close(backend->handles[index].fd);
+        memset(&backend->handles[index], 0,
+               sizeof(backend->handles[index]));
+    }
     for (index = 0; index < VENUS_MAX_IMAGES; index++)
         memset(&backend->images[index], 0,
                sizeof(backend->images[index]));
@@ -954,9 +978,16 @@ void venus_objects_destroy_all(struct venus_backend *backend)
  * vaExportSurfaceHandle and will not use hardware decoding without it; with it
  * they can import the decoded surface as an EGLImage and stay on the GPU.
  *
- * A linearly-mapped DMA-BUF heap buffer holds NV12 as one object with two
- * planes, which is the layout everything expects for a semi-planar format.
- * The application owns the returned fd and closes it.
+ * A linearly-mapped DMA-BUF heap buffer holds NV12 as one object.  The
+ * application owns the returned fd and closes it.
+ *
+ * The layer layout has to follow what the caller asked for, and the default
+ * matters: VLC's GL interop passes neither VA_EXPORT_SURFACE_SEPARATE_LAYERS
+ * nor VA_EXPORT_SURFACE_COMPOSED_LAYERS, and then rejects any layer that holds
+ * more than one plane.  Answering with a single composed NV12 layer made it
+ * drop every frame into a texture that was never filled - a flat green picture.
+ * Separate layers are therefore the default; only an explicit
+ * VA_EXPORT_SURFACE_COMPOSED_LAYERS request gets the composed layer.
  */
 static VAStatus backend_export_surface_handle(
     VADriverContextP context, VASurfaceID surface_id, uint32_t memory_type,
@@ -966,6 +997,7 @@ static VAStatus backend_export_surface_handle(
         venus_backend_from_context(context);
     VADRMPRIMESurfaceDescriptor *exported = descriptor;
     struct venus_surface *surface;
+    bool composed;
     uint32_t luma_size;
     int fd;
 
@@ -979,6 +1011,7 @@ static VAStatus backend_export_surface_handle(
                             VA_EXPORT_SURFACE_SEPARATE_LAYERS |
                             VA_EXPORT_SURFACE_COMPOSED_LAYERS))
         return VA_STATUS_ERROR_INVALID_PARAMETER;
+    composed = (flags & VA_EXPORT_SURFACE_COMPOSED_LAYERS) != 0;
 
     pthread_mutex_lock(&backend->mutex);
     surface = venus_backend_find_surface(backend, surface_id);
@@ -1000,24 +1033,207 @@ static VAStatus backend_export_surface_handle(
     exported->width = surface->width;
     exported->height = surface->height;
     exported->num_objects = 1;
+    /* Both layouts live in this single object, so every layer refers to
+     * object 0 - object_index[] is zeroed by the memset above. */
     exported->objects[0].fd = fd;
     exported->objects[0].size = (uint32_t)surface->capacity;
     exported->objects[0].drm_format_modifier = VENUS_DRM_FORMAT_MOD_LINEAR;
-    exported->num_layers = 1;
-    exported->layers[0].drm_format = VENUS_DRM_FORMAT_NV12;
-    exported->layers[0].num_planes = 2;
-    exported->layers[0].object_index[0] = 0;
-    exported->layers[0].object_index[1] = 0;
-    exported->layers[0].offset[0] = 0;
-    exported->layers[0].offset[1] = luma_size;
-    exported->layers[0].pitch[0] = surface->width;
-    exported->layers[0].pitch[1] = surface->width;
+
+    if (composed) {
+        /* Luma and interleaved chroma as the two planes of one NV12 layer. */
+        exported->num_layers = 1;
+        exported->layers[0].drm_format = VENUS_DRM_FORMAT_NV12;
+        exported->layers[0].num_planes = 2;
+        exported->layers[0].offset[0] = 0;
+        exported->layers[0].offset[1] = luma_size;
+        exported->layers[0].pitch[0] = surface->width;
+        exported->layers[0].pitch[1] = surface->width;
+    } else {
+        /* One layer per plane, which is the layout the pre-1.1 API callers
+         * expect: the layers carry the DRM plane formats. */
+        exported->num_layers = 2;
+        exported->layers[0].drm_format = VENUS_DRM_FORMAT_R8;
+        exported->layers[0].num_planes = 1;
+        exported->layers[0].offset[0] = 0;
+        exported->layers[0].pitch[0] = surface->width;
+        exported->layers[1].drm_format = VENUS_DRM_FORMAT_GR88;
+        exported->layers[1].num_planes = 1;
+        exported->layers[1].offset[0] = luma_size;
+        exported->layers[1].pitch[0] = surface->width;
+    }
     pthread_mutex_unlock(&backend->mutex);
 
     venus_backend_log(backend,
-                      "export-surface id=0x%x fd=%d bytes=%zu %ux%u",
+                      "export-surface id=0x%x fd=%d bytes=%zu %ux%u %s",
                       surface_id, fd, surface->capacity, surface->width,
-                      surface->height);
+                      surface->height,
+                      composed ? "composed" : "separate-layers");
+    return VA_STATUS_SUCCESS;
+}
+
+/*
+ * Legacy DRM prime hand-off.
+ *
+ * VLC's GL interop (glconv_vaapi_wl) imports surfaces through the pre-1.1 API:
+ * it derives a VAImage for the surface and then asks for the surface's DMA-BUF
+ * with vaAcquireBufferHandle(image.buf, mem_type = 0).  Only
+ * vaExportSurfaceHandle() used to be implemented, so the stub in va_stubs.c
+ * answered VA_STATUS_ERROR_INVALID_BUFFER and VLC abandoned hardware decoding
+ * ("video output creation failed" -> 4K software decode -> frozen picture).
+ *
+ * The handle is a dup() of the surface's DMA-BUF fd: the application can import
+ * it with EGL and close it whenever it likes without disturbing the surface,
+ * and the surface keeps its own reference for decoding.
+ *
+ * The spec makes this a synchronisation point, but clients only get here after
+ * vaSyncSurface() on the parent surface - the derived image is useless
+ * otherwise - and the decode path has already written the frame into the
+ * surface by then.
+ */
+static struct venus_buffer_handle *acquired_handle_locked(
+    struct venus_backend *backend, VABufferID buffer_id)
+{
+    unsigned int index;
+
+    if (!buffer_id)
+        return NULL;
+
+    for (index = 0; index < VENUS_MAX_BUFFER_HANDLES; index++) {
+        if (backend->handles[index].buffer_id == buffer_id)
+            return &backend->handles[index];
+    }
+
+    return NULL;
+}
+
+static void release_buffer_handle_locked(struct venus_backend *backend,
+                                         VABufferID buffer_id)
+{
+    struct venus_buffer_handle *handle =
+        acquired_handle_locked(backend, buffer_id);
+
+    if (!handle)
+        return;
+
+    if (handle->fd >= 0)
+        close(handle->fd);
+    *handle = (struct venus_buffer_handle) { 0 };
+}
+
+/* The surface behind a buffer, if that buffer is an image's backing store.
+ * Clients hand us image.buf, not the surface, so the image table is the only
+ * link between the two.
+ */
+static struct venus_surface *image_surface_for_buffer_locked(
+    struct venus_backend *backend, VABufferID buffer_id)
+{
+    unsigned int index;
+
+    for (index = 0; index < VENUS_MAX_IMAGES; index++) {
+        if (backend->images[index].used &&
+            backend->images[index].buffer_id == buffer_id)
+            return venus_backend_find_surface(
+                backend, backend->images[index].surface_id);
+    }
+
+    return NULL;
+}
+
+static VAStatus backend_acquire_buffer_handle(VADriverContextP context,
+                                              VABufferID buffer_id,
+                                              VABufferInfo *info)
+{
+    struct venus_backend *backend =
+        venus_backend_from_context(context);
+    struct venus_buffer_handle *handle;
+    struct venus_surface *surface;
+    unsigned long exported_handle;
+    size_t size;
+    int fd;
+    unsigned int index;
+
+    if (!backend || !info)
+        return VA_STATUS_ERROR_INVALID_PARAMETER;
+    /* mem_type is a bit mask of the memory types the caller accepts on input
+     * and the one that was used on output; 0 means "driver's choice". */
+    if (info->mem_type != 0 &&
+        info->mem_type != VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME)
+        return VA_STATUS_ERROR_UNSUPPORTED_MEMORY_TYPE;
+
+    pthread_mutex_lock(&backend->mutex);
+    if (!venus_backend_find_buffer(backend, buffer_id)) {
+        pthread_mutex_unlock(&backend->mutex);
+        return VA_STATUS_ERROR_INVALID_BUFFER;
+    }
+
+    surface = image_surface_for_buffer_locked(backend, buffer_id);
+    if (!surface) {
+        /* Plain buffers are CPU memory with no DMA-BUF behind them. */
+        pthread_mutex_unlock(&backend->mutex);
+        return VA_STATUS_ERROR_UNSUPPORTED_BUFFERTYPE;
+    }
+    if (surface->dmabuf_fd < 0) {
+        /* No accessible DMA-BUF heap: surface_memory_allocate() fell back to
+         * plain memory, so nothing can be exported. */
+        pthread_mutex_unlock(&backend->mutex);
+        return VA_STATUS_ERROR_UNSUPPORTED_MEMORY_TYPE;
+    }
+
+    handle = acquired_handle_locked(backend, buffer_id);
+    if (!handle) {
+        for (index = 0; index < VENUS_MAX_BUFFER_HANDLES; index++) {
+            if (!backend->handles[index].buffer_id) {
+                handle = &backend->handles[index];
+                break;
+            }
+        }
+    }
+    if (!handle) {
+        pthread_mutex_unlock(&backend->mutex);
+        return VA_STATUS_ERROR_MAX_NUM_EXCEEDED;
+    }
+
+    if (handle->buffer_id != buffer_id) {
+        fd = fcntl(surface->dmabuf_fd, F_DUPFD_CLOEXEC, 0);
+        if (fd < 0) {
+            pthread_mutex_unlock(&backend->mutex);
+            return VA_STATUS_ERROR_OPERATION_FAILED;
+        }
+        handle->buffer_id = buffer_id;
+        handle->fd = fd;
+    } else {
+        /* Re-acquiring an already held handle: hand out the same fd, which
+         * stays valid until vaReleaseBufferHandle(). */
+        fd = handle->fd;
+    }
+
+    exported_handle = (unsigned long)fd;
+    size = surface->capacity;
+    info->mem_type = VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME;
+    info->handle = exported_handle;
+    info->mem_size = size;
+    pthread_mutex_unlock(&backend->mutex);
+
+    venus_backend_log(backend,
+                      "acquire-buffer-handle buffer=0x%x fd=%d bytes=%zu",
+                      buffer_id, fd, size);
+    return VA_STATUS_SUCCESS;
+}
+
+static VAStatus backend_release_buffer_handle(VADriverContextP context,
+                                              VABufferID buffer_id)
+{
+    struct venus_backend *backend =
+        venus_backend_from_context(context);
+
+    if (!backend)
+        return VA_STATUS_ERROR_INVALID_CONTEXT;
+
+    pthread_mutex_lock(&backend->mutex);
+    /* Idempotent on purpose: clients such as VLC call this unconditionally,
+     * including straight after a failed acquire. */
+    release_buffer_handle_locked(backend, buffer_id);
+    pthread_mutex_unlock(&backend->mutex);
     return VA_STATUS_SUCCESS;
 }
 
@@ -1041,4 +1257,6 @@ void venus_objects_fill_vtable(struct VADriverVTable *vtable)
     vtable->vaQuerySurfaceAttributes =
         backend_query_surface_attributes;
     vtable->vaExportSurfaceHandle = backend_export_surface_handle;
+    vtable->vaAcquireBufferHandle = backend_acquire_buffer_handle;
+    vtable->vaReleaseBufferHandle = backend_release_buffer_handle;
 }
