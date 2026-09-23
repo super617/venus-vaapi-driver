@@ -22,7 +22,9 @@ The repository currently provides:
 - a bounded H.264 Annex-B assembler that reconstructs conservative SPS/PPS
   NAL units and validates every VA slice range before copying it;
 - an isolated V4L2 stateful decoder session and `venus-v4l2-decode` tool for
-  validating queue order, MMAP buffers, source-change events and drain;
+  validating queue order, MMAP buffers, source-change events and drain, with
+  `--codec=hevc` and `--codec=vp9` covering the other two coded formats the
+  kernel exposes on the same node;
 - experimental H.264 Baseline/Main/High VLD config, context, buffer, surface,
   sync and NV12 image-download paths backed by that same session;
 - a device-validated H.264 stateful encoder session for NV12 input,

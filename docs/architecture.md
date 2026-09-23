@@ -91,6 +91,14 @@ in display order. The device
 test uses a progressive stream without B frames so queue correctness can be
 established before timestamp-to-surface reordering is introduced.
 
+`--codec=hevc` runs the same session against HEVC, where the access-unit
+delimiter is an AUD with nal_unit_type 35 and the splitter therefore has to be
+told which codec it is reading. `--codec=vp9` takes an IVF container instead:
+VP9 carries no start codes, and the IVF frame table is what gives the per-picture
+boundaries the firmware needs - two pictures in one OUTPUT buffer stall the
+decoder just as a whole Annex-B stream does. Both formats are otherwise the same
+queueing and drain sequence as H.264.
+
 ## H.264 bytestream reconstruction
 
 FFmpeg submits the original slice NAL bytes through `VASliceDataBufferType`,

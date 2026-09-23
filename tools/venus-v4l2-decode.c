@@ -13,6 +13,24 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* H.264 and HEVC reach the decoder as Annex-B byte streams; VP9 has no start
+ * codes at all, so its probe takes an IVF container instead and queues exactly
+ * one IVF frame per OUTPUT buffer. */
+struct input_codec {
+    const char *name;
+    const char *display_name;
+    uint32_t coded_format;
+    bool ivf;
+    enum venus_annexb_codec annexb;
+};
+
+static const struct input_codec input_codecs[] = {
+    { "h264", "H.264", V4L2_PIX_FMT_H264, false, VENUS_ANNEXB_H264 },
+    { "hevc", "HEVC", V4L2_PIX_FMT_HEVC, false, VENUS_ANNEXB_HEVC },
+    /* The Annex-B splitter never sees a VP9 stream; the field is filler. */
+    { "vp9", "VP9", V4L2_PIX_FMT_VP9, true, VENUS_ANNEXB_H264 },
+};
+
 struct access_unit_stats {
     size_t count;
     size_t maximum;
@@ -66,6 +84,69 @@ static int submit_access_unit(const uint8_t *data, size_t size,
         run->error = status;
 
     return status;
+}
+
+/* IVF: a 32-byte "DKIF" header, then per frame a 4-byte little-endian size and
+ * an 8-byte timestamp ahead of the compressed frame. */
+static int for_each_ivf_frame(const uint8_t *data, size_t size,
+                              venus_access_unit_callback callback,
+                              void *opaque, size_t *num_units)
+{
+    size_t offset = 32;
+    size_t units = 0;
+
+    if (size < offset || memcmp(data, "DKIF", 4) != 0)
+        return -EINVAL;
+
+    while (offset + 12 <= size) {
+        uint32_t frame_size = data[offset] | (data[offset + 1] << 8) |
+                              (data[offset + 2] << 16) |
+                              ((uint32_t)data[offset + 3] << 24);
+        int result;
+
+        offset += 12;
+        if (frame_size == 0 || frame_size > size - offset)
+            return -EINVAL;
+
+        result = callback(data + offset, frame_size, opaque);
+        if (result < 0)
+            return result;
+
+        offset += frame_size;
+        units++;
+    }
+
+    if (units == 0 || offset != size)
+        return -EINVAL;
+
+    if (num_units)
+        *num_units = units;
+    return 0;
+}
+
+static int for_each_input_unit(const struct input_codec *codec,
+                               const uint8_t *data, size_t size,
+                               venus_access_unit_callback callback,
+                               void *opaque, size_t *num_units)
+{
+    if (codec->ivf)
+        return for_each_ivf_frame(data, size, callback, opaque, num_units);
+
+    return venus_annexb_for_each_access_unit(
+        data, size, codec->annexb, callback, opaque, num_units);
+}
+
+static const struct input_codec *lookup_codec(const char *name)
+{
+    size_t index;
+
+    for (index = 0; index < sizeof(input_codecs) / sizeof(input_codecs[0]);
+         index++) {
+        if (strcmp(name, input_codecs[index].name) == 0)
+            return &input_codecs[index];
+    }
+
+    return NULL;
 }
 
 static int parse_positive(const char *text, unsigned int *value)
@@ -146,6 +227,7 @@ int main(int argc, char **argv)
     struct venus_v4l2_error open_error = { 0 };
     struct access_unit_stats stats = { 0 };
     struct decode_run run = { 0 };
+    const struct input_codec *codec = &input_codecs[0];
     const char *device;
     const char *input_path;
     const char *output_path;
@@ -158,26 +240,38 @@ int main(int argc, char **argv)
     bool eos = false;
     int64_t deadline;
     int status;
+    int first = 1;
 
-    if (argc != 6 && argc != 7) {
+    if (argc > 1 && strncmp(argv[1], "--codec=", 8) == 0) {
+        codec = lookup_codec(argv[1] + 8);
+        if (!codec) {
+            fprintf(stderr,
+                    "--codec must be one of h264, hevc, vp9\n");
+            return 2;
+        }
+        first = 2;
+    }
+
+    if (argc - first != 5 && argc - first != 6) {
         fprintf(stderr,
-                "usage: %s WIDTH HEIGHT FRAMES INPUT OUTPUT [DEVICE]\n",
+                "usage: %s [--codec=h264|hevc|vp9] WIDTH HEIGHT FRAMES "
+                "INPUT OUTPUT [DEVICE]\n",
                 argv[0]);
         return 2;
     }
 
-    if (parse_positive(argv[1], &width) < 0 ||
-        parse_positive(argv[2], &height) < 0 ||
-        parse_positive(argv[3], &expected_frames) < 0) {
+    if (parse_positive(argv[first], &width) < 0 ||
+        parse_positive(argv[first + 1], &height) < 0 ||
+        parse_positive(argv[first + 2], &expected_frames) < 0) {
         fprintf(stderr, "width, height and frames must be positive\n");
         return 2;
     }
 
-    input_path = argv[4];
-    output_path = argv[5];
+    input_path = argv[first + 3];
+    output_path = argv[first + 4];
 
-    if (argc == 7) {
-        device = argv[6];
+    if (argc - first == 6) {
+        device = argv[first + 5];
     } else {
         status = venus_v4l2_probe(&capabilities);
         if (status < 0 || capabilities.decoder_path[0] == '\0') {
@@ -194,17 +288,18 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    status = venus_annexb_for_each_access_unit(
-        input, input_size, inspect_access_unit, &stats, &units);
+    status = for_each_input_unit(
+        codec, input, input_size, inspect_access_unit, &stats, &units);
     if (status < 0) {
-        fprintf(stderr, "split Annex-B input: %s\n", strerror(-status));
+        fprintf(stderr, "split %s input: %s\n", codec->name,
+                strerror(-status));
         free(input);
         return 1;
     }
 
     config = (struct venus_v4l2_decoder_config) {
         .device = device,
-        .coded_format = V4L2_PIX_FMT_H264,
+        .coded_format = codec->coded_format,
         .width = width,
         .height = height,
         .output_buffer_size =
@@ -233,13 +328,14 @@ int main(int argc, char **argv)
     }
 
     printf("device=%s\n", device);
+    printf("codec=%s\n", codec->name);
     printf("input_bytes=%zu\n", input_size);
     printf("access_units=%zu\n", units);
     printf("output_buffers=%u\n",
            venus_v4l2_decoder_output_count(decoder));
 
-    status = venus_annexb_for_each_access_unit(
-        input, input_size, submit_access_unit, &run, NULL);
+    status = for_each_input_unit(
+        codec, input, input_size, submit_access_unit, &run, NULL);
     if (status < 0)
         goto finish;
 
@@ -287,7 +383,8 @@ finish:
         fprintf(stderr, "FAIL operation=%s error=%s (%d)\n",
                 operation, strerror(-status), -status);
     } else {
-        puts("PASS: V4L2 stateful H.264 decode completed");
+        printf("PASS: V4L2 stateful %s decode completed\n",
+               codec->display_name);
     }
 
     venus_v4l2_decoder_close(decoder);

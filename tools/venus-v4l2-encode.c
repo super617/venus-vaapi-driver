@@ -18,6 +18,42 @@ struct encode_run {
     size_t bytes;
 };
 
+/* The coded format decides which profile/level control pair the session uses;
+ * LEVEL_4_1 is the highest the iris encoder accepts for HEVC (5_1 is an
+ * ERANGE). */
+struct coder {
+    const char *name;
+    const char *display_name;
+    uint32_t coded_format;
+    uint32_t coded_profile;
+    uint32_t coded_level;
+};
+
+static const struct coder coders[] = {
+    {
+        "h264", "H.264", V4L2_PIX_FMT_H264,
+        V4L2_MPEG_VIDEO_H264_PROFILE_BASELINE,
+        V4L2_MPEG_VIDEO_H264_LEVEL_4_1,
+    },
+    {
+        "hevc", "HEVC", V4L2_PIX_FMT_HEVC,
+        V4L2_MPEG_VIDEO_HEVC_PROFILE_MAIN,
+        V4L2_MPEG_VIDEO_HEVC_LEVEL_4_1,
+    },
+};
+
+static const struct coder *lookup_coder(const char *name)
+{
+    size_t index;
+
+    for (index = 0; index < sizeof(coders) / sizeof(coders[0]); index++) {
+        if (strcmp(name, coders[index].name) == 0)
+            return &coders[index];
+    }
+
+    return NULL;
+}
+
 static int write_packet(const struct venus_v4l2_packet *packet,
                         void *opaque)
 {
@@ -63,6 +99,7 @@ int main(int argc, char **argv)
     struct venus_v4l2_encoder *encoder = NULL;
     struct venus_v4l2_error open_error = { 0 };
     struct encode_run run = { 0 };
+    const struct coder *coder = &coders[0];
     const char *device;
     uint8_t *frame = NULL;
     FILE *input = NULL;
@@ -76,19 +113,30 @@ int main(int argc, char **argv)
     bool eos = false;
     int64_t deadline;
     int status = 0;
+    int first = 1;
 
-    if (argc != 8 && argc != 9) {
+    if (argc > 1 && strncmp(argv[1], "--codec=", 8) == 0) {
+        coder = lookup_coder(argv[1] + 8);
+        if (!coder) {
+            fprintf(stderr, "--codec must be one of h264, hevc\n");
+            return 2;
+        }
+        first = 2;
+    }
+
+    if (argc - first != 7 && argc - first != 8) {
         fprintf(stderr,
-                "usage: %s WIDTH HEIGHT FPS FRAMES BITRATE INPUT OUTPUT [DEVICE]\n",
+                "usage: %s [--codec=h264|hevc] WIDTH HEIGHT FPS FRAMES "
+                "BITRATE INPUT OUTPUT [DEVICE]\n",
                 argv[0]);
         return 2;
     }
 
-    if (parse_positive(argv[1], &width) < 0 ||
-        parse_positive(argv[2], &height) < 0 ||
-        parse_positive(argv[3], &frames_per_second) < 0 ||
-        parse_positive(argv[4], &frame_count) < 0 ||
-        parse_positive(argv[5], &bitrate) < 0 ||
+    if (parse_positive(argv[first], &width) < 0 ||
+        parse_positive(argv[first + 1], &height) < 0 ||
+        parse_positive(argv[first + 2], &frames_per_second) < 0 ||
+        parse_positive(argv[first + 3], &frame_count) < 0 ||
+        parse_positive(argv[first + 4], &bitrate) < 0 ||
         width % 2 || height % 2 ||
         (size_t)width > SIZE_MAX / height) {
         fprintf(stderr, "invalid numeric argument\n");
@@ -102,8 +150,8 @@ int main(int argc, char **argv)
     }
     frame_size += frame_size / 2;
 
-    if (argc == 9) {
-        device = argv[8];
+    if (argc - first == 8) {
+        device = argv[first + 7];
     } else {
         status = venus_v4l2_probe(&capabilities);
         if (status < 0 || capabilities.encoder_path[0] == '\0') {
@@ -113,14 +161,14 @@ int main(int argc, char **argv)
         device = capabilities.encoder_path;
     }
 
-    input = fopen(argv[6], "rb");
+    input = fopen(argv[first + 5], "rb");
     if (!input) {
-        fprintf(stderr, "open %s: %s\n", argv[6], strerror(errno));
+        fprintf(stderr, "open %s: %s\n", argv[first + 5], strerror(errno));
         return 1;
     }
-    run.output = fopen(argv[7], "wb");
+    run.output = fopen(argv[first + 6], "wb");
     if (!run.output) {
-        fprintf(stderr, "open %s: %s\n", argv[7], strerror(errno));
+        fprintf(stderr, "open %s: %s\n", argv[first + 6], strerror(errno));
         fclose(input);
         return 1;
     }
@@ -133,14 +181,14 @@ int main(int argc, char **argv)
 
     config = (struct venus_v4l2_encoder_config) {
         .device = device,
-        .coded_format = V4L2_PIX_FMT_H264,
+        .coded_format = coder->coded_format,
         .width = width,
         .height = height,
         .frames_per_second = frames_per_second,
         .bitrate = bitrate,
         .gop_size = frames_per_second,
-        .h264_profile = V4L2_MPEG_VIDEO_H264_PROFILE_BASELINE,
-        .h264_level = V4L2_MPEG_VIDEO_H264_LEVEL_4_1,
+        .coded_profile = coder->coded_profile,
+        .coded_level = coder->coded_level,
         .capture_buffer_size = 1024 * 1024,
         .output_buffers = 4,
         .capture_buffers = 16,
@@ -156,6 +204,7 @@ int main(int argc, char **argv)
     }
 
     printf("device=%s\n", device);
+    printf("codec=%s\n", coder->name);
     printf("frame_size=%zu\n", frame_size);
     printf("output_size=%u\n",
            venus_v4l2_encoder_output_size(encoder));
@@ -214,7 +263,8 @@ finish:
         fprintf(stderr, "FAIL operation=%s error=%s (%d)\n",
                 operation, strerror(-status), -status);
     } else {
-        puts("PASS: V4L2 stateful H.264 encode completed");
+        printf("PASS: V4L2 stateful %s encode completed\n",
+               coder->display_name);
     }
 
     venus_v4l2_encoder_close(encoder);
