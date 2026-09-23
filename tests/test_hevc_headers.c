@@ -118,6 +118,46 @@ static void test_unsupported_sequences(void)
     assert(venus_hevc_write_parameter_sets(&writer, &sequence, 0) == -ENOTSUP);
 }
 
+/* A VA-API client reports whether a stream reorders pictures, and the
+ * parameter sets have to say so: a decoder told to lag as far behind its input
+ * as the DPB allows never returns a picture to a client that has stopped
+ * submitting.  Stamping the DPB size in regardless of the flag - which this
+ * used to do - makes both of these renders identical.
+ */
+static void test_reorder_pics(void)
+{
+    VAPictureParameterBufferHEVC picture;
+    struct venus_hevc_sequence sequence;
+    uint8_t reordered[VENUS_HEVC_HEADERS_MAX * 2];
+    uint8_t no_reorder[VENUS_HEVC_HEADERS_MAX * 2];
+    struct venus_annexb_writer writer;
+    size_t reordered_size;
+    size_t no_reorder_size;
+
+    fill_picture(&picture);
+    fill_sequence(&picture, &sequence);
+
+    picture.pic_fields.bits.NoPicReorderingFlag = 0;
+    writer = (struct venus_annexb_writer) {
+        .data = reordered,
+        .capacity = sizeof(reordered),
+    };
+    assert(venus_hevc_write_parameter_sets(&writer, &sequence, 0) == 0);
+    reordered_size = writer.length;
+
+    picture.pic_fields.bits.NoPicReorderingFlag = 1;
+    writer = (struct venus_annexb_writer) {
+        .data = no_reorder,
+        .capacity = sizeof(no_reorder),
+    };
+    assert(venus_hevc_write_parameter_sets(&writer, &sequence, 0) == 0);
+    no_reorder_size = writer.length;
+
+    assert(reordered_size != no_reorder_size ||
+           memcmp(reordered, no_reorder, reordered_size) != 0);
+    assert(no_reorder_size < VENUS_HEVC_HEADERS_MAX);
+}
+
 /* The picture parameter set id sits behind the two NAL unit header bytes,
  * the first slice flag and, on a random access picture, the
  * no_output_of_prior_pics flag.
@@ -141,6 +181,7 @@ int main(void)
 {
     test_parameter_sets();
     test_unsupported_sequences();
+    test_reorder_pics();
     test_pps_id();
     printf("hevc-headers ok\n");
     return 0;

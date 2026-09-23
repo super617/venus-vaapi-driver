@@ -826,8 +826,8 @@ static VAStatus backend_sync_surface(VADriverContextP driver_context,
     status = sync_surface_locked(
         backend, surface, VENUS_SYNC_TIMEOUT_MS);
     venus_backend_log(backend,
-                      "sync-surface id=0x%x status=%d bytes=%zu",
-                      surface_id, status, surface->data_size);
+                      "sync-surface id=0x%x status=%d bytes=%zu ready=%d",
+                      surface_id, status, surface->data_size, surface->ready);
     pthread_mutex_unlock(&backend->mutex);
     return status;
 }
