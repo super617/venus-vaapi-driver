@@ -13,13 +13,13 @@ annexb_split_test = executable(
 
 v4l2_decoder_test = executable(
   'test-v4l2-decoder',
-  files('../src/v4l2_decoder.c', 'test_v4l2_decoder.c'),
+  common_sources + files('../src/v4l2_decoder.c', 'test_v4l2_decoder.c'),
   include_directories: project_inc,
 )
 
 v4l2_encoder_test = executable(
   'test-v4l2-encoder',
-  encoder_sources + files('test_v4l2_encoder.c'),
+  common_sources + encoder_sources + files('test_v4l2_encoder.c'),
   include_directories: project_inc,
 )
 
