@@ -31,6 +31,7 @@ common_sources = files(
 codec_sources = files(
   'src/bit_writer.c',
   'src/h264_annexb.c',
+  'src/hevc_headers.c',
 )
 
 stateful_sources = files(

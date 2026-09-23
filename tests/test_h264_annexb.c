@@ -85,7 +85,7 @@ int main(int argc, char **argv)
         0x65, 0x88, 0x84,
         0x00, 0x00, 0x00, 0x01, 0x41, 0x9a,
     };
-    struct venus_h264_slice_batch batches[2];
+    struct venus_slice_batch batches[2];
     uint8_t output[1024];
     size_t output_size = 0;
 
@@ -99,14 +99,14 @@ int main(int argc, char **argv)
     parameters[1].slice_data_size = 6;
     parameters[1].slice_data_flag = VA_SLICE_DATA_FLAG_ALL;
 
-    batches[0] = (struct venus_h264_slice_batch) {
-        .parameters = &parameters[0],
+    batches[0] = (struct venus_slice_batch) {
+        .parameters = (const struct venus_slice_parameters *)&parameters[0],
         .num_parameters = 1,
         .data = slices,
         .data_size = sizeof(slices),
     };
-    batches[1] = (struct venus_h264_slice_batch) {
-        .parameters = &parameters[1],
+    batches[1] = (struct venus_slice_batch) {
+        .parameters = (const struct venus_slice_parameters *)&parameters[1],
         .num_parameters = 1,
         .data = slices,
         .data_size = sizeof(slices),
