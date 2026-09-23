@@ -6,8 +6,9 @@ initially targeting Xiaomi Redmi K20 Pro / Mi 9T Pro (Raphael, SM8150).
 ## Current status
 
 **H.264 High VLD and EncSlice are validated for progressive 8-bit video
-through Raphael's native 1080x2340 and 2340x1080 orientations. Other codecs
-remain disabled.**
+through Raphael's native 1080x2340 and 2340x1080 orientations. HEVC Main
+decode and encode, and VP9 Profile 0 decode, are validated on QCM6490/QCS6490
+boards (iris_vpu, `msm_vidc_driver`). VP8 remains disabled.**
 
 The repository currently provides:
 
@@ -21,6 +22,9 @@ The repository currently provides:
   exported ABI symbol;
 - a bounded H.264 Annex-B assembler that reconstructs conservative SPS/PPS
   NAL units and validates every VA slice range before copying it;
+- HEVC parameter sets rebuilt the same way in `src/hevc_headers.c`: VA-API
+  hands over parsed fields, not VPS/SPS/PPS NAL units, so they are written
+  back out of `VAPictureParameterBufferHEVC` and emitted once per sequence;
 - an isolated V4L2 stateful decoder session and `venus-v4l2-decode` tool for
   validating queue order, MMAP buffers, source-change events and drain, with
   `--codec=hevc` and `--codec=vp9` covering the other two coded formats the
@@ -40,9 +44,9 @@ because libva searches compatible lower minor-version init symbols.
 | Codec | Decode | Encode |
 | --- | --- | --- |
 | H.264 Baseline/Main/High | Baseline and High validated; Main pending | High validated through 1080x2340 |
-| HEVC Main 8-bit | planned | planned |
+| HEVC Main 8-bit | validated on QCM6490, 720p and 1080p, bit-exact | validated on QCM6490, CBR |
 | VP8 | planned | planned |
-| VP9 Profile 0 | planned | not exposed |
+| VP9 Profile 0 | validated on QCM6490, bit-exact | not exposed by the firmware |
 
 The initial H.264 path passed a 30-frame byte-exact VA-API hardware test on
 Raphael. See [device validation](docs/device-validation.md). Other codec
